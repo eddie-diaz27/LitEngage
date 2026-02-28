@@ -1,0 +1,1062 @@
+# CLAUDE CODE INSTRUCTIONS - Library Engagement Agent System
+# Execute in PLAN MODE for comprehensive task breakdown
+
+## PROJECT OVERVIEW
+
+You are building a complete AI-powered book recommendation system for a school library to increase student reading engagement. The system mimics a helpful librarian who provides personalized book recommendations based on student reading history, preferences, and age-appropriate reading levels.
+
+**Core Value Proposition:** Librarians observe that students read books recommended by them, based on what similar students enjoyed. This system scales that personalized recommendation capability using LLMs and RAG.
+
+**Target Users:**
+- Primary: K-12 students (ages 5-18) seeking book recommendations
+- Secondary: Librarians monitoring recommendations and managing the catalog
+
+**Key Constraints:**
+- MUST comply with COPPA (Children's Online Privacy Protection Act) - no student PII to external APIs
+- MUST comply with FERPA (Family Educational Rights and Privacy Act) - protect educational records
+- MUST provide age-appropriate, reading-level-appropriate recommendations only
+- MUST have safety guardrails to prevent harmful content
+
+---
+
+## TECHNICAL REQUIREMENTS - STRICT SPECIFICATIONS
+
+### Required Technology Stack (NON-NEGOTIABLE)
+
+**LLM Provider:**
+- Use Google Gemini models via the new unified `langchain-google-genai` library
+- Default model: `gemini-2.0-flash-exp` (configurable via .env)
+- Model selection MUST be configurable through environment variables
+- Support switching between Flash (fast/cheap) and Pro (better quality) models
+
+**Agentic Framework:**
+- LangGraph (StateGraph, NOT legacy AgentExecutor)
+- MUST implement: Persistent checkpoints (SqliteSaver for MVP)
+- MUST implement: Long-term memory (Store interface for student preferences)
+- MUST implement: Human-in-the-loop interrupts (optional librarian review)
+- MUST use: Tool-calling agent pattern (ReAct style)
+
+**Safety & Guardrails:**
+- DeepTeam guardrails library (NOT NeMo Guardrails or other alternatives)
+- MUST implement ALL of these guards:
+  - PromptInjectionGuard (input)
+  - TopicalGuard (input) - only book/reading topics
+  - ToxicityGuard (output)
+  - PrivacyGuard (output)
+  - HallucinationGuard (output)
+- Guardrails MUST run on EVERY LLM interaction (input and output)
+- MUST use Gemini as the judge model for guardrails (not OpenAI)
+- MUST have fallback messages for guardrail breaches
+
+**Backend:**
+- FastAPI with Pydantic v2 for all data validation
+- SQLite database with SQLAlchemy ORM
+- Database MUST include: students, books, reading_history, chat_sessions, chat_messages, recommendations_log
+- ALL business logic in backend (Streamlit is just presentation)
+
+**Frontend:**
+- Streamlit multi-page application
+- MUST have: Home page, Student Chat, Librarian Dashboard, Book Catalog
+- MUST use httpx to call FastAPI (not direct database access)
+- MUST implement: Simple authentication (streamlit-authenticator or basic role selection)
+
+**Vector Store & RAG:**
+- ChromaDB for semantic book search
+- sentence-transformers/all-MiniLM-L6-v2 for embeddings (384 dimensions)
+- MUST use Maximal Marginal Relevance (MMR) for diversity in recommendations
+- MUST filter by reading level and age appropriateness before semantic search
+
+**Database (Local Development):**
+- SQLite with WAL mode enabled
+- MUST have Alembic migrations (even though it's SQLite)
+- MUST store: full book catalog, student profiles, reading history, chat conversations, recommendation logs
+
+---
+
+## CORE FEATURES - MUST IMPLEMENT ALL
+
+### 1. LANGGRAPH AGENT SYSTEM
+
+**State Schema:**
+```python
+class BookAgentState(TypedDict):
+    messages: Annotated[List, add_messages]  # Uses LangGraph's message accumulator
+    student_id: str                           # Current student
+    user_preferences: Optional[dict]          # Extracted preferences (genres, themes, pace)
+    reading_history: Optional[list]           # Books this student has read
+    search_results: Optional[list]            # Current book candidates from vector search
+    recommendations: Optional[list]           # Final recommendation set
+    metadata: dict                            # Session metadata (start time, model used, etc.)
+```
+
+**Graph Nodes (REQUIRED):**
+1. `agent_node`: LLM with bound tools (search_books, get_reading_history, save_preference, get_book_details)
+2. `tool_node`: Executes tool calls
+3. `input_guardrail_node`: DeepTeam checks BEFORE LLM
+4. `output_guardrail_node`: DeepTeam checks AFTER LLM
+5. `librarian_review_node`: Optional human-in-the-loop interrupt
+6. `save_recommendation_node`: Log to database
+
+**Graph Edges:**
+- START → input_guardrail_node → agent_node
+- agent_node → conditional edge:
+  - If tool calls → tool_node → agent_node (loop)
+  - If no tools → output_guardrail_node → save_recommendation_node → END
+- Optional: output_guardrail_node → librarian_review_node → END (if enabled)
+
+**Tools to Implement:**
+```python
+@tool
+def search_books(query: str, reading_level: str, genres: List[str] = None, max_results: int = 10) -> List[dict]:
+    """Search book catalog using semantic similarity with metadata filters.
+    
+    Args:
+        query: Natural language search query (e.g., "exciting adventure with magic")
+        reading_level: Target reading level (early-reader, elementary, middle-school, high-school)
+        genres: Optional genre filters
+        max_results: Number of books to return
+    """
+    # Implementation: ChromaDB MMR search with metadata filters
+    
+@tool
+def get_reading_history(student_id: str, limit: int = 20) -> List[dict]:
+    """Get student's reading history (completed and current books)."""
+    # Implementation: Query reading_history table
+    
+@tool
+def get_book_details(book_id: str) -> dict:
+    """Get full details for a specific book by ID."""
+    # Implementation: Query books table with all metadata
+    
+@tool
+def save_preference(student_id: str, preference_type: str, value: str) -> dict:
+    """Save a user preference (favorite genre, disliked themes, etc.)."""
+    # Implementation: Update student preferences JSON field
+```
+
+**Persistence:**
+- Use `SqliteSaver` for checkpoints (conversation state)
+- Thread IDs: `f"student_{student_id}_{session_id}"`
+- Store: `InMemoryStore` for MVP (or `PostgresStore` if implementing production)
+- MUST persist across browser refreshes (load from thread_id)
+
+**System Prompt (CRITICAL):**
+```
+You are a friendly, knowledgeable school librarian helping students find books they'll love. Your goal is to:
+
+1. Understand the student's reading preferences through conversation
+2. Use tools to search the library catalog based on their interests, reading level, and past reading history
+3. Recommend 2-3 books that match their preferences, with brief, engaging explanations
+4. Encourage reading by highlighting what makes each book exciting or interesting
+
+Important guidelines:
+- ALWAYS filter by the student's reading level - never recommend books above or below their level
+- NEVER recommend books with inappropriate content for the student's age
+- If you don't have good matches in the catalog, say so honestly and ask about alternative preferences
+- Keep explanations brief and enthusiastic (2-3 sentences per book)
+- Encourage diversity - don't only recommend from the same genre they've read before
+
+You can ONLY help with book recommendations and library questions. Politely redirect any off-topic queries.
+```
+
+### 2. DEEPTEAM GUARDRAILS INTEGRATION
+
+**Implementation Requirements:**
+- Create `backend/services/guardrails.py` with all guards configured
+- Guards MUST be initialized ONCE at app startup (not per request - expensive!)
+- MUST use async methods (`a_guard_input`, `a_guard_output`) for better performance
+
+**Input Guardrail Flow:**
+```python
+async def check_input_guardrails(message: str) -> tuple[bool, str]:
+    """Returns (is_safe, fallback_message_if_unsafe)"""
+    result = await guardrails.a_guard_input(
+        llm_input=message,
+        expected_output="A response about book recommendations"
+    )
+    
+    if result.safe:
+        return True, ""
+    
+    # Determine specific breach type
+    if result.prompt_injection:
+        return False, "I can only help with book recommendations and library questions!"
+    elif result.topical_breach:
+        return False, "Let's keep our conversation focused on books and reading. How can I help you find a great book?"
+    else:
+        return False, "I'm having trouble understanding that request. Could you rephrase it?"
+```
+
+**Output Guardrail Flow (with retries):**
+```python
+MAX_RETRIES = 3
+
+async def check_output_guardrails(response: str, context: str, attempt: int = 1) -> tuple[bool, str]:
+    """Returns (is_safe, safe_response_or_original)"""
+    result = await guardrails.a_guard_output(
+        llm_output=response,
+        llm_input=context
+    )
+    
+    if result.safe:
+        return True, response
+    
+    # Log the breach
+    logger.warning(f"Output guardrail breach on attempt {attempt}: {result.breaches}")
+    
+    if attempt >= MAX_RETRIES:
+        # Use safe fallback after max retries
+        return False, "I apologize, but I'm having trouble generating a good recommendation right now. Would you like to try searching for a different type of book?"
+    
+    # Trigger retry (handled by caller - regenerate with modified prompt)
+    return False, ""
+```
+
+**Configuration:**
+- TopicalGuard allowed topics: ["books", "reading", "library", "literature", "authors", "genres", "stories", "recommendations", "writing"]
+- ALL guards use Gemini as judge: `DEEPTEAM_MODEL=gemini-2.0-flash-exp`
+- Sample rate: 1.0 for MVP (check every request)
+- Thresholds: All set to most strict settings
+
+### 3. DATABASE SCHEMA (SQLAlchemy Models)
+
+**Complete Schema:**
+
+```python
+# students table
+class Student(Base):
+    __tablename__ = "students"
+    
+    id = Column(String, primary_key=True)  # UUID
+    name = Column(String, nullable=False)
+    grade_level = Column(Integer)  # 1-12
+    reading_level = Column(String)  # early-reader, elementary, middle-school, high-school
+    preferences_json = Column(JSON)  # {favorite_genres: [], disliked_themes: [], reading_pace: ""}
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_active = Column(DateTime)
+
+# books table
+class Book(Base):
+    __tablename__ = "books"
+    
+    id = Column(String, primary_key=True)  # Use book_id from dataset
+    isbn = Column(String, unique=True, index=True)
+    isbn13 = Column(String)
+    title = Column(String, nullable=False, index=True)
+    title_without_series = Column(String)
+    author = Column(String, nullable=False, index=True)  # Primary author extracted from authors list
+    authors_json = Column(JSON)  # Full authors list with author_ids
+    description = Column(Text)
+    genres_json = Column(JSON)  # Extracted from popular_shelves (top genre tags)
+    popular_shelves_json = Column(JSON)  # Full popular_shelves data
+    similar_books_json = Column(JSON)  # List of similar book_ids from dataset
+    reading_level = Column(String, index=True)  # Inferred: "middle-school" or "high-school" for YA
+    age_appropriate = Column(String)  # Inferred: "12-15" or "15-18"
+    publication_year = Column(Integer, index=True)
+    publication_month = Column(Integer)
+    publication_day = Column(Integer)
+    publisher = Column(String)
+    format = Column(String)  # Paperback, Hardcover, Kindle, etc.
+    num_pages = Column(Integer)
+    language_code = Column(String, default='eng')
+    country_code = Column(String)
+    avg_rating = Column(Float, index=True)
+    ratings_count = Column(Integer, index=True)
+    text_reviews_count = Column(Integer)
+    image_url = Column(String)  # Book cover URL
+    goodreads_link = Column(String)
+    series_json = Column(JSON)  # Series IDs if part of a series
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# reading_history table
+class ReadingHistory(Base):
+    __tablename__ = "reading_history"
+    
+    id = Column(Integer, primary_key=True)
+    student_id = Column(String, ForeignKey("students.id"))
+    book_id = Column(String, ForeignKey("books.id"))
+    status = Column(String)  # "reading", "completed", "wishlist", "abandoned"
+    rating = Column(Integer)  # 1-5, nullable
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    
+    student = relationship("Student", back_populates="reading_history")
+    book = relationship("Book")
+
+# chat_sessions table
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    
+    id = Column(Integer, primary_key=True)
+    student_id = Column(String, ForeignKey("students.id"))
+    thread_id = Column(String, unique=True, index=True)  # For LangGraph persistence
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_message_at = Column(DateTime)
+    
+    messages = relationship("ChatMessage", back_populates="session")
+
+# chat_messages table
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id"))
+    role = Column(String)  # "user", "assistant", "system"
+    content = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    
+    session = relationship("ChatSession", back_populates="messages")
+
+# recommendations_log table
+class RecommendationLog(Base):
+    __tablename__ = "recommendations_log"
+    
+    id = Column(Integer, primary_key=True)
+    student_id = Column(String, ForeignKey("students.id"))
+    book_ids_json = Column(JSON)  # List of recommended book IDs
+    explanation = Column(Text)  # LLM's explanation of why these books
+    model_used = Column(String)  # "gemini-2.0-flash-exp"
+    reading_level_filter = Column(String)
+    genres_searched = Column(JSON)
+    feedback = Column(String)  # "thumbs_up", "thumbs_down", null
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# book_reviews table (from dataset reviews)
+class BookReview(Base):
+    __tablename__ = "book_reviews"
+    
+    id = Column(Integer, primary_key=True)
+    review_id = Column(String, unique=True, index=True)  # From dataset
+    user_id = Column(String, index=True)  # Anonymized user from dataset
+    book_id = Column(String, ForeignKey("books.id"), index=True)
+    rating = Column(Integer)  # 1-5
+    review_text = Column(Text)  # Full review text for sentiment analysis
+    date_added = Column(DateTime)
+    date_updated = Column(DateTime)
+    n_votes = Column(Integer)  # Helpfulness votes
+    n_comments = Column(Integer)
+    started_at = Column(DateTime)  # When user started reading
+    read_at = Column(DateTime)  # When user finished reading
+    sentiment = Column(String)  # "positive", "negative", "neutral" (computed)
+    themes_extracted_json = Column(JSON)  # Extracted themes (optional, for future)
+    
+    book = relationship("Book")
+```
+
+### 4. VECTOR STORE (CHROMADB) SETUP
+
+**Embedding Pipeline:**
+```python
+def create_book_document(book: Book) -> Document:
+    """Convert book record to LangChain Document for embedding."""
+    
+    # Combine semantic fields into rich text
+    content = f"{book.title} by {book.author}. "
+    
+    if book.description:
+        content += f"{book.description} "
+    
+    if book.genres_json:
+        genres_str = ", ".join(book.genres_json)
+        content += f"Genres: {genres_str}. "
+    
+    if book.themes_json:
+        themes_str = ", ".join(book.themes_json)
+        content += f"Themes: {themes_str}."
+    
+    # Metadata for filtering (NOT embedded)
+    metadata = {
+        "book_id": book.id,
+        "title": book.title,
+        "author": book.author,
+        "reading_level": book.reading_level,
+        "age_appropriate": book.age_appropriate,
+        "publication_year": book.publication_year,
+        "avg_rating": book.avg_rating or 0,
+        "genres": book.genres_json or [],
+    }
+    
+    return Document(page_content=content, metadata=metadata)
+```
+
+**Search Implementation (MMR for Diversity):**
+```python
+def search_books_semantic(
+    query: str,
+    reading_level: str,
+    genres: List[str] = None,
+    k: int = 10
+) -> List[dict]:
+    """Semantic search with metadata filtering and diversity."""
+    
+    # Build metadata filter
+    filter_dict = {"reading_level": reading_level}
+    if genres:
+        filter_dict["genres"] = {"$in": genres}
+    
+    # MMR search (70% relevance, 30% diversity)
+    results = vectorstore.max_marginal_relevance_search(
+        query=query,
+        k=k,
+        fetch_k=k * 3,  # Fetch 3x, then pick diverse k
+        lambda_mult=0.7,
+        filter=filter_dict
+    )
+    
+    # Convert to book dicts
+    return [
+        {
+            "book_id": doc.metadata["book_id"],
+            "title": doc.metadata["title"],
+            "author": doc.metadata["author"],
+            "relevance_score": doc.metadata.get("score", 0)
+        }
+        for doc in results
+    ]
+```
+
+**MUST implement:**
+- Embedding generation script: `scripts/generate_embeddings.py`
+- Automatic re-embedding when books are added/updated
+- Progress bars for long embedding operations (tqdm)
+
+### 5. FASTAPI BACKEND STRUCTURE
+
+**Required Endpoints:**
+
+```python
+# Chat endpoints
+POST /api/chat/sessions                    # Create new chat session
+GET /api/chat/sessions/{session_id}        # Get session history
+POST /api/chat/message                     # Send message, get recommendation
+DELETE /api/chat/sessions/{session_id}     # Clear session
+
+# Student endpoints
+GET /api/students/{student_id}             # Get student profile
+PUT /api/students/{student_id}/preferences # Update preferences
+GET /api/students/{student_id}/history     # Get reading history
+
+# Book endpoints
+GET /api/books                             # List books (paginated, filtered)
+GET /api/books/{book_id}                   # Get book details
+POST /api/books/search                     # Semantic search
+
+# Recommendation endpoints
+GET /api/recommendations/recent            # Recent recommendations (for librarian)
+POST /api/recommendations/{rec_id}/feedback # Thumbs up/down
+GET /api/recommendations/analytics         # Dashboard metrics
+
+# Health/monitoring
+GET /api/health                            # Health check
+GET /api/metrics                           # Usage metrics
+```
+
+**Request/Response Schemas (Pydantic):**
+```python
+class ChatMessageRequest(BaseModel):
+    student_id: str
+    session_id: str
+    message: str
+
+class ChatMessageResponse(BaseModel):
+    message: str
+    recommendations: Optional[List[BookRecommendation]]
+    session_id: str
+    
+class BookRecommendation(BaseModel):
+    book_id: str
+    title: str
+    author: str
+    explanation: str
+    cover_url: Optional[str]
+    
+class StudentProfile(BaseModel):
+    id: str
+    name: str
+    grade_level: int
+    reading_level: str
+    preferences: dict
+```
+
+### 6. STREAMLIT FRONTEND
+
+**Page Structure:**
+
+**Home.py:**
+- Welcome screen
+- Role selection: "I'm a Student" / "I'm a Librarian"
+- Quick stats: "X books in catalog, Y recommendations made this week"
+
+**pages/1_Student_Chat.py:**
+- Student selector (dropdown or login)
+- Chat interface using `st.chat_message` and `st.chat_input`
+- Streaming responses from Gemini (`st.write_stream`)
+- Display recommended books in expandable cards
+- Thumbs up/down feedback buttons
+- "Start New Conversation" button
+
+**pages/2_Librarian_Dashboard.py:**
+- Overview metrics:
+  - Recommendations this week
+  - Most popular books
+  - Student engagement (active students)
+  - Genre distribution
+- Recent recommendations table (with student anonymization)
+- Ability to view/override specific recommendations
+- Book catalog management (add/edit books)
+
+**pages/3_Book_Catalog.py:**
+- Searchable/filterable book list
+- Filters: reading level, genre, rating
+- Sort by: title, author, rating, publication year
+- Click to view full book details
+
+**MUST implement:**
+- Session state management (persist student selection)
+- Error handling with friendly messages
+- Loading indicators during API calls
+- Responsive layout (works on tablets)
+
+### 7. DATA LOADING SCRIPTS
+
+**scripts/init_db.py:**
+- Create all SQLAlchemy tables
+- Enable WAL mode on SQLite
+- Create indexes
+- Seed initial admin librarian account
+
+**scripts/load_books.py:**
+- **Three-stage preprocessing for all datasets**
+- Stage 1: Filter books to 5-10K high-quality subset
+  * Read goodreads_books_young_adult.json (newline-delimited)
+  * Apply filters: ratings_count >= 200, average_rating >= 3.8, publication_year >= 1990
+  * Sort by ratings_count DESC, take top 5K-10K
+  * Extract genres from popular_shelves
+  * Extract primary author from authors list
+  * Save selected book_ids set for stages 2 & 3
+  * Insert into Books table
+- Stage 2: Filter interactions (only for selected books)
+  * Read goodreads_interactions_young_adult.json line-by-line
+  * Keep only if book_id in selected_book_ids
+  * Create synthetic student profiles from unique user_ids
+  * Expected result: ~500K-2M filtered interactions
+- Stage 3: Filter reviews (only for selected books)
+  * Read goodreads_reviews_young_adult.json line-by-line
+  * Keep only if book_id in selected_book_ids and review_text exists
+  * Store for later sentiment analysis
+  * Expected result: ~100K-400K filtered reviews
+- Progress bars (tqdm), error handling, statistics logging
+
+**scripts/generate_embeddings.py:**
+- Query all books from database
+- Create Document objects
+- Generate embeddings with sentence-transformers
+- Populate ChromaDB collection
+- Save metadata
+- Progress bar for user feedback
+
+**scripts/create_sample_students.py:**
+- Create 10-20 mock students
+- Varying grade levels (1-12)
+- Diverse reading preferences
+- For testing/demo purposes
+
+**scripts/seed_reading_history.py:**
+- Assign 3-8 books to each mock student
+- Mix of completed, reading, wishlist statuses
+- Realistic ratings (3-5 stars mostly)
+- For collaborative filtering testing
+
+### 8. CONFIGURATION & ENVIRONMENT MANAGEMENT
+
+**backend/config.py:**
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    # Gemini
+    google_api_key: str
+    gemini_model: str = "gemini-2.0-flash-exp"
+    gemini_temperature: float = 0.7
+    
+    # Database
+    database_url: str = "sqlite:///./data/library.db"
+    
+    # ChromaDB
+    chroma_persist_directory: str = "./data/chroma_books_db"
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    
+    # FastAPI
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    cors_origins: List[str] = ["http://localhost:8501"]
+    
+    # Streamlit
+    backend_api_url: str = "http://localhost:8000"
+    
+    # Security
+    secret_key: str
+    
+    # DeepTeam
+    deepteam_model: str = "gemini-2.0-flash-exp"
+    
+    # LangSmith (optional)
+    langchain_tracing_v2: bool = False
+    langchain_api_key: Optional[str] = None
+    
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+### 9. ERROR HANDLING & LOGGING
+
+**MUST implement:**
+- Structured logging (JSON format) using `python-json-logger`
+- Log levels: DEBUG for development, INFO for production
+- Log all guardrail breaches
+- Log all LLM API calls (with cost tracking)
+- Log all tool invocations
+- Graceful error handling with user-friendly messages
+- Sentry integration (optional, for production)
+
+**Example logging:**
+```python
+import logging
+from pythonjsonlogger import jsonlogger
+
+logger = logging.getLogger(__name__)
+handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter()
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# Usage
+logger.info("Recommendation generated", extra={
+    "student_id": student_id,
+    "books_recommended": [b["title"] for b in books],
+    "model": "gemini-2.0-flash-exp",
+    "latency_ms": latency
+})
+```
+
+### 10. TESTING REQUIREMENTS
+
+**Unit Tests (pytest):**
+- Test all database CRUD operations
+- Test guardrail logic (mock DeepTeam responses)
+- Test vector search logic
+- Test Pydantic schema validation
+
+**Integration Tests:**
+- Test full agent conversation flow
+- Test FastAPI endpoints
+- Test book recommendation pipeline end-to-end
+
+**Test Fixtures:**
+- Mock student database
+- Mock book catalog (small subset)
+- Mock LLM responses (deterministic for testing)
+
+**Coverage Target:**
+- Minimum 70% code coverage
+- 100% coverage for critical paths (guardrails, recommendations)
+
+---
+
+## IMPLEMENTATION PLAN - PHASED APPROACH
+
+### Phase 1: Foundation (Week 1-2)
+1. Set up project structure (folders, __init__.py files)
+2. Create database models and migrations
+3. Implement configuration management (Settings)
+4. Create data loading scripts (init_db, load_books)
+5. Download and process UCSD Book Graph dataset
+6. Generate ChromaDB embeddings
+7. Create sample students and reading history
+
+**Deliverable:** Working database with books and students, embeddings ready
+
+### Phase 2: Backend Core (Week 2-3)
+1. Set up FastAPI application structure
+2. Implement all Pydantic schemas
+3. Create database CRUD operations
+4. Implement vector search service
+5. Create health check and basic endpoints
+6. Test with Postman/curl
+
+**Deliverable:** Working FastAPI backend with search functionality
+
+### Phase 3: LangGraph Agent (Week 3-4)
+1. Define BookAgentState schema
+2. Implement all tools (search_books, get_history, etc.)
+3. Build StateGraph (nodes and edges)
+4. Configure SqliteSaver for persistence
+5. Write agent system prompt
+6. Test agent in isolation (Python script)
+
+**Deliverable:** Functional LangGraph agent that can recommend books
+
+### Phase 4: DeepTeam Guardrails (Week 4-5)
+1. Set up DeepTeam with Gemini as judge
+2. Implement all 5 required guards
+3. Create input/output guardrail wrapper functions
+4. Integrate into agent workflow
+5. Add fallback message logic
+6. Test guardrail breaches (prompt injection, off-topic, etc.)
+
+**Deliverable:** Safe agent that blocks malicious inputs and harmful outputs
+
+### Phase 5: API Integration (Week 5)
+1. Create chat endpoints in FastAPI
+2. Connect LangGraph agent to API routes
+3. Implement session management
+4. Add recommendation logging
+5. Create analytics endpoints
+6. Test full backend flow
+
+**Deliverable:** Complete backend API ready for frontend
+
+### Phase 6: Streamlit Frontend (Week 6-7)
+1. Create Home.py landing page
+2. Build Student Chat interface
+3. Implement httpx API client
+4. Add streaming support for responses
+5. Create book display components
+6. Add feedback buttons
+7. Build Librarian Dashboard
+8. Create Book Catalog browser
+
+**Deliverable:** Working frontend connected to backend
+
+### Phase 7: Testing & Polish (Week 7-8)
+1. Write unit tests for all components
+2. Write integration tests
+3. Test COPPA/FERPA compliance
+4. Add error handling everywhere
+5. Improve logging
+6. Performance optimization
+7. Documentation (README, API docs)
+
+**Deliverable:** Production-ready MVP
+
+### Phase 8: Deployment Prep (Week 8+)
+1. Create Dockerfile
+2. Set up docker-compose for local development
+3. Configure for GCP Cloud Run
+4. Set up CI/CD (optional)
+5. Create deployment guide
+6. Monitoring and alerting setup
+
+**Deliverable:** Deployable application
+
+---
+
+## CRITICAL IMPLEMENTATION NOTES
+
+### COPPA/FERPA Compliance
+- NEVER send student names, emails, or PII to Gemini API
+- Only send: grade level, reading level, generic preferences
+- Use anonymous UUIDs for student_id
+- Implement data minimization - only collect what's necessary
+- Add data retention policy (auto-delete old sessions)
+- Document compliance measures for school administrators
+
+### DeepTeam Guardrail Best Practices
+- Initialize guards ONCE at startup (expensive to create)
+- Use async methods for better performance
+- Set `sample_rate=1.0` initially, reduce if latency issues
+- Log ALL breaches for audit
+- Test guardrails thoroughly (try to break them!)
+- Have clear fallback messages for each breach type
+
+### LangGraph Agent Best Practices
+- Keep state schema minimal (only what you need)
+- Use `add_messages` reducer for conversation history
+- Bind tools with CLEAR, SPECIFIC descriptions (LLM needs good descriptions to call them)
+- Test agent with edge cases (no results, ambiguous queries, etc.)
+- Use LangSmith to debug agent behavior
+- Implement timeout for tool execution (5-10 seconds max)
+
+### Vector Search Best Practices
+- ALWAYS filter by reading level first (hard constraint)
+- Use MMR for diversity (lambda=0.7)
+- Fetch 3x more results than needed, then filter
+- Cache embeddings (don't regenerate unnecessarily)
+- Consider adding collaborative filtering later (if you have interaction data)
+
+### Performance Optimization
+- Use async/await throughout FastAPI
+- Connection pooling for database
+- Semantic caching for common queries (Redis)
+- Batch embeddings generation
+- Lazy load ChromaDB (don't load entire index into memory)
+
+### Error Handling
+- Never expose internal errors to students
+- Log detailed errors server-side
+- Show friendly messages to users
+- Implement retry logic for LLM API calls (with exponential backoff)
+- Have circuit breakers for external services
+
+---
+
+## SUCCESS CRITERIA
+
+The system is considered successfully implemented when:
+
+1. ✅ A student can log in, ask for a book recommendation, and receive 2-3 age-appropriate suggestions
+2. ✅ Recommendations are based on the student's reading level and preferences
+3. ✅ The system blocks prompt injection attempts (guardrails working)
+4. ✅ The system refuses off-topic queries politely
+5. ✅ The system never recommends books above/below the student's reading level
+6. ✅ Conversations persist across sessions (checkpointing works)
+7. ✅ Librarian can view recommendation analytics
+8. ✅ All book recommendations are real books from the catalog (no hallucinations)
+9. ✅ Student PII is never sent to external APIs
+10. ✅ The system handles errors gracefully without crashing
+
+**Bonus Success Criteria:**
+- Semantic caching reduces LLM API calls by >50%
+- Response latency <3 seconds for most queries
+- Unit test coverage >70%
+- Deployed to GCP Cloud Run
+- LangSmith tracing shows clear agent reasoning
+
+---
+
+## DATASET DOWNLOAD INSTRUCTIONS
+
+**Primary Dataset: UCSD Goodreads - Young Adult Subset (ALL THREE COMPONENTS)**
+- URL: https://cseweb.ucsd.edu/~jmcauley/datasets/goodreads.html
+- Academic research dataset from Julian McAuley's Lab at UCSD
+- Collected late 2017, free for academic/research use
+
+**All three files are REQUIRED:**
+
+1. **goodreads_books_young_adult.json.gz** (REQUIRED)
+   - 93,398 YA books with complete metadata
+   - ~200 MB compressed, ~500-800 MB uncompressed
+   - Download: https://mcauleylab.ucsd.edu/public_datasets/gdrive/goodreads/byGenre/goodreads_books_young_adult.json.gz
+
+2. **goodreads_interactions_young_adult.json.gz** (REQUIRED)
+   - 34,919,254 user-book interactions
+   - ~1-2 GB compressed, ~4-6 GB uncompressed
+   - Download: https://mcauleylab.ucsd.edu/public_datasets/gdrive/goodreads/byGenre/goodreads_interactions_young_adult.json.gz
+   - **Purpose**: Collaborative filtering for "students who liked X also liked Y" recommendations
+
+3. **goodreads_reviews_young_adult.json.gz** (REQUIRED)
+   - 2,389,900 detailed text reviews with ratings
+   - ~800 MB compressed, ~2-3 GB uncompressed
+   - Download: https://mcauleylab.ucsd.edu/public_datasets/gdrive/goodreads/byGenre/goodreads_reviews_young_adult.json.gz
+   - **Purpose**: Sentiment analysis, theme extraction, understanding *why* students like/dislike books
+
+**Download process:**
+```bash
+mkdir -p data/raw
+cd data/raw
+
+# Download all three datasets
+wget https://mcauleylab.ucsd.edu/public_datasets/gdrive/goodreads/byGenre/goodreads_books_young_adult.json.gz
+wget https://mcauleylab.ucsd.edu/public_datasets/gdrive/goodreads/byGenre/goodreads_interactions_young_adult.json.gz
+wget https://mcauleylab.ucsd.edu/public_datasets/gdrive/goodreads/byGenre/goodreads_reviews_young_adult.json.gz
+
+# Decompress all
+gunzip goodreads_books_young_adult.json.gz
+gunzip goodreads_interactions_young_adult.json.gz
+gunzip goodreads_reviews_young_adult.json.gz
+
+cd ../..
+```
+
+**Dataset Structure:**
+
+**Books JSON (newline-delimited JSON):**
+```json
+{
+  "book_id": "5",
+  "isbn": "0439708184",
+  "isbn13": "9780439708184",
+  "title": "Harry Potter and the Order of the Phoenix",
+  "title_without_series": "Harry Potter and the Order of the Phoenix",
+  "authors": [{"author_id": "1077326", "role": ""}],
+  "description": "Harry Potter is due to start his fifth year...",
+  "average_rating": "4.47",
+  "ratings_count": "2095690",
+  "text_reviews_count": "6333",
+  "popular_shelves": [
+    {"count": "41214", "name": "to-read"},
+    {"count": "6627", "name": "fantasy"},
+    {"count": "5566", "name": "favorites"}
+  ],
+  "similar_books": ["1", "2", "3"],
+  "series": ["45175"],
+  "publication_year": "2003",
+  "publication_month": "9",
+  "publication_day": "1",
+  "publisher": "Scholastic Inc.",
+  "format": "Paperback",
+  "num_pages": "652",
+  "language_code": "eng",
+  "country_code": "US",
+  "image_url": "https://images.gr-assets.com/books/...",
+  "link": "https://www.goodreads.com/book/show/5.Harry_Potter..."
+}
+```
+
+**Interactions JSON (newline-delimited JSON):**
+```json
+{
+  "user_id": "8842281e1d1347389f2ab93d60773d4d",
+  "book_id": "5",
+  "is_read": true,
+  "rating": 5,
+  "is_reviewed": false,
+  "date_added": "Wed Nov 13 13:38:46 -0800 2013",
+  "date_updated": "Wed Nov 13 13:38:46 -0800 2013"
+}
+```
+
+**Reviews JSON (newline-delimited JSON):**
+```json
+{
+  "user_id": "8842281e1d1347389f2ab93d60773d4d",
+  "book_id": "5",
+  "review_id": "abc123",
+  "rating": 5,
+  "review_text": "This was absolutely amazing! I couldn't put it down...",
+  "date_added": "Wed Nov 13 13:38:46 -0800 2013",
+  "date_updated": "Wed Nov 13 13:38:46 -0800 2013",
+  "n_votes": 24,
+  "n_comments": 3,
+  "started_at": "Mon Oct 07 00:00:00 -0700 2013",
+  "read_at": "Wed Nov 13 00:00:00 -0800 2013"
+}
+```
+
+**CRITICAL - Preprocessing & Filtering Strategy for 5-10K Books:**
+
+The full dataset contains 93K books, 35M interactions, and 2.4M reviews. For efficient development, implement this multi-stage filtering process in `scripts/load_books.py`:
+
+**Stage 1: Filter Books (Target: 5,000-10,000 books)**
+```python
+# Load all books from JSON
+# Apply quality filters:
+#   - ratings_count >= 200 (well-known books with substantial data)
+#   - average_rating >= 3.8 (high quality only)
+#   - publication_year >= 1990 (modern classics + recent books)
+#   - language_code == 'eng' (English only)
+#   - has description (required for embeddings)
+# 
+# Sort by: ratings_count DESC (most popular first)
+# Take top: 5,000-10,000 books
+# 
+# Save selected book_ids to a set for Stage 2 filtering
+```
+
+**Stage 2: Filter Interactions (Only for selected books)**
+```python
+# Load interactions JSON line by line
+# Keep only interactions where book_id is in selected_book_ids set
+# This reduces 35M interactions to ~500K-2M interactions
+# Save filtered interactions to database or processed file
+```
+
+**Stage 3: Filter Reviews (Only for selected books)**
+```python
+# Load reviews JSON line by line
+# Keep only reviews where book_id is in selected_book_ids set
+# This reduces 2.4M reviews to ~100K-400K reviews
+# Optionally: further filter to reviews with review_text (non-empty)
+# Save filtered reviews to database or processed file
+```
+
+**Why This Approach:**
+- Creates a coherent, high-quality subset
+- All three datasets are aligned (same books)
+- Manageable size for development: ~5-10K books, ~500K-2M interactions, ~100K-400K reviews
+- Fast embeddings generation (~10-20 minutes vs hours)
+- Still enough data for collaborative filtering and sentiment analysis
+- Can expand to full dataset later without code changes
+
+**Key Fields Mapping for Our System:**
+- `book_id` → Use as primary key in database (links all three datasets)
+- `popular_shelves` → Extract genres (top shelf names like "fantasy", "romance", "mystery")
+- `description` → Use for semantic embeddings (RAG)
+- `similar_books` → Pre-computed similar book IDs (use for recommendations)
+- `average_rating` + `ratings_count` → Quality and popularity signals
+- `publication_year` → For filtering modern vs classic books
+- `authors` → Extract author names for display and filtering
+- `image_url` → Book cover for UI display
+- `interactions.rating` → For collaborative filtering algorithms
+- `interactions.is_read` → Implicit preference signal
+- `reviews.review_text` → For sentiment analysis, theme extraction
+- `reviews.rating` → Sentiment complement to review text
+
+**Citation Requirement:**
+If using this dataset, cite:
+- Wan, M., & McAuley, J. (2018). Item Recommendation on Monotonic Behavior Chains. RecSys'18.
+- Wan, M., Misra, R., Nakashole, N., & McAuley, J. (2019). Fine-Grained Spoiler Detection from Large-Scale Review Corpora. ACL'19.
+
+---
+
+## FINAL CHECKLIST BEFORE STARTING
+
+Before you begin implementation, ensure:
+
+- [ ] requirements.txt is installed in a virtual environment
+- [ ] .env file is created from .env.example with real API keys
+- [ ] UCSD Book Graph dataset is downloaded to data/raw/
+- [ ] You understand the LangGraph StateGraph architecture
+- [ ] You understand DeepTeam guardrails and how they integrate
+- [ ] You know the difference between FastAPI (business logic) and Streamlit (presentation)
+- [ ] You have a plan for handling COPPA/FERPA compliance
+- [ ] You're ready to build in phases (don't try to do everything at once!)
+
+---
+
+## CLAUDE CODE - START IN PLAN MODE
+
+**Recommended approach:**
+
+1. START by reviewing CLAUDE.md for project structure understanding
+2. CREATE a detailed implementation plan broken into subtasks
+3. IMPLEMENT Phase 1 (Foundation) completely before moving to Phase 2
+4. TEST each component in isolation before integration
+5. COMMIT frequently with clear commit messages
+6. USE LangSmith for debugging agent behavior
+7. ASK for clarification if any requirement is unclear
+
+**First concrete tasks:**
+
+1. Set up project folder structure (all directories from CLAUDE.md)
+2. Create all __init__.py files
+3. Create backend/config.py with Settings
+4. Create backend/database/models.py with ALL tables
+5. Create backend/database/connection.py with SQLAlchemy engine
+6. Create scripts/init_db.py to create tables
+7. Run init_db.py to create library.db
+8. Download UCSD dataset and place in data/raw/
+9. Create scripts/load_books.py to import books
+10. Verify books are in database
+
+Then move to Phase 2, etc.
+
+---
+
+## QUESTIONS TO ASK IF STUCK
+
+- "How should I structure the LangGraph state for this use case?"
+- "What's the best way to integrate DeepTeam into a LangGraph node?"
+- "How do I implement human-in-the-loop with LangGraph interrupts?"
+- "What's the best practice for Streamlit + FastAPI architecture?"
+- "How should I handle errors when the LLM fails to call a tool?"
+
+---
+
+## REMEMBER
+
+This is a COPPA/FERPA-compliant system for CHILDREN. Safety, privacy, and age-appropriateness are NON-NEGOTIABLE. When in doubt, be conservative. Better to over-filter than under-filter. The goal is to get kids excited about reading, not to showcase AI capabilities. The AI is a tool to scale librarian expertise, not to replace human judgment.
+
+Good luck! Build something that makes students love reading. 📚
