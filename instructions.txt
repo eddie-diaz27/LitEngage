@@ -3,12 +3,12 @@
 
 ## PROJECT OVERVIEW
 
-You are building a complete AI-powered book recommendation system for a school library to increase student reading engagement. The system mimics a helpful librarian who provides personalized book recommendations based on student reading history, preferences, and age-appropriate reading levels.
+You are building a complete AI-powered book recommendation system for a school library to increase student reading engagement. The system mimics a helpful librarian who provides personalized book recommendations based on student reading history, preferences, and reviews.
 
 **Core Value Proposition:** Librarians observe that students read books recommended by them, based on what similar students enjoyed. This system scales that personalized recommendation capability using LLMs and RAG.
 
 **Target Users:**
-- Primary: K-12 students (ages 5-18) seeking book recommendations
+- Primary: 6-12 students (ages 11-18) seeking book recommendations
 - Secondary: Librarians monitoring recommendations and managing the catalog
 
 **Key Constraints:**
