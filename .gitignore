@@ -52,3 +52,6 @@ htmlcov/
 
 # Claude Code
 .claude/
+
+# Presentation files
+presentation/
