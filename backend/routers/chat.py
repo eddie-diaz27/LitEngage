@@ -6,8 +6,10 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from backend.config import settings
 from backend.database.connection import get_db
 from backend.database import crud
+from backend.database.models import TokenUsage
 from backend.schemas.chat import (
     ChatMessageDetail,
     ChatMessageRequest,
@@ -15,10 +17,45 @@ from backend.schemas.chat import (
     ChatSessionCreate,
     ChatSessionResponse,
 )
+from backend.schemas.admin import LibrarianChatRequest, LibrarianChatResponse
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+# Gemini 2.5 Flash pricing (per 1M tokens)
+TOKEN_COST_PER_MILLION = {
+    "input": 0.15,
+    "output": 0.60,
+}
+
+
+def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    """Estimate USD cost based on Gemini pricing."""
+    cost = (prompt_tokens / 1_000_000) * TOKEN_COST_PER_MILLION["input"]
+    cost += (completion_tokens / 1_000_000) * TOKEN_COST_PER_MILLION["output"]
+    return round(cost, 6)
+
+
+def _save_token_usage(db, student_id, request_type, result):
+    """Save token usage record from agent result."""
+    token_info = result.get("token_usage", {})
+    prompt_tokens = token_info.get("prompt_tokens", 0)
+    completion_tokens = token_info.get("completion_tokens", 0)
+
+    usage = TokenUsage(
+        student_id=student_id,
+        request_type=request_type,
+        model_used=result.get("model_used", settings.gemini_model),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=token_info.get("total_tokens", 0),
+        estimated_cost_usd=_estimate_cost(prompt_tokens, completion_tokens),
+        latency_ms=result.get("latency_ms", 0),
+        tools_used=result.get("tools_used", []),
+    )
+    db.add(usage)
+    db.commit()
 
 
 @router.post("/sessions", response_model=ChatSessionResponse)
@@ -98,7 +135,23 @@ async def send_message(
     # Save user message to DB
     crud.create_chat_message(db, session.id, "user", request.message)
 
-    # Input guardrail check
+    # Layer 1: Zero-cost profanity pre-filter (no tokens, sub-ms)
+    from backend.services.profanity_filter import get_profanity_filter
+    pf = get_profanity_filter()
+    is_clean, rejection = pf.check_input(request.message, context="student")
+    if not is_clean:
+        crud.create_chat_message(db, session.id, "assistant", rejection)
+        logger.info(
+            "Profanity filter triggered (student)",
+            extra={"student_id": request.student_id},
+        )
+        return ChatMessageResponse(
+            message=rejection,
+            session_id=session_id,
+            guardrail_triggered=True,
+        )
+
+    # Layer 2: DeepTeam guardrail check (costs guard tokens, catches injection/off-topic)
     guardrails = get_guardrail_service()
     is_safe, fallback, details = await guardrails.check_input(request.message)
 
@@ -152,10 +205,66 @@ async def send_message(
     # Save assistant response to DB
     crud.create_chat_message(db, session.id, "assistant", response_message)
 
+    # Save token usage
+    _save_token_usage(db, request.student_id, "chat", result)
+
     return ChatMessageResponse(
         message=response_message,
         session_id=session_id,
         guardrail_triggered=not is_safe,
+    )
+
+
+@router.post("/message/librarian", response_model=LibrarianChatResponse)
+async def send_librarian_message(
+    request: LibrarianChatRequest,
+    db: Session = Depends(get_db),
+):
+    """Librarian chat endpoint - returns response with debug metadata."""
+    from backend.services.agent import invoke_agent
+    from backend.services.profanity_filter import get_profanity_filter
+
+    session_id = request.session_id or str(uuid.uuid4())
+
+    # Layer 1: Zero-cost profanity pre-filter (no tokens, sub-ms)
+    pf = get_profanity_filter()
+    is_clean, rejection = pf.check_input(request.message, context="librarian")
+    if not is_clean:
+        logger.info("Profanity filter triggered (librarian)")
+        return LibrarianChatResponse(
+            message=rejection,
+            session_id=session_id,
+            token_usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            latency_ms=0,
+            tools_used=[],
+            model_used="profanity_filter",
+        )
+
+    # Use a librarian-specific thread
+    result = await invoke_agent(
+        student_id="librarian",
+        message=request.message,
+        session_id=session_id,
+        student_data={
+            "reading_level": "high-school",
+            "grade_level": 12,
+        },
+    )
+
+    response_message = result.get("message", "")
+
+    # Save token usage as librarian_analysis
+    _save_token_usage(db, None, "librarian_analysis", result)
+
+    token_info = result.get("token_usage", {})
+
+    return LibrarianChatResponse(
+        message=response_message,
+        session_id=session_id,
+        token_usage=token_info,
+        latency_ms=result.get("latency_ms"),
+        tools_used=result.get("tools_used"),
+        model_used=result.get("model_used"),
     )
 
 

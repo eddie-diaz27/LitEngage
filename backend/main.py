@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import settings
 from backend.logging_config import setup_logging
-from backend.routers import books, chat, recommendations, students
+from backend.routers import admin, auth, books, chat, gamification, loans, recommendations, reviews, students
 
 # Initialize logging
 setup_logging(
@@ -37,10 +37,15 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(books.router, prefix=settings.api_prefix)
 app.include_router(students.router, prefix=settings.api_prefix)
 app.include_router(recommendations.router, prefix=settings.api_prefix)
 app.include_router(chat.router, prefix=settings.api_prefix)
+app.include_router(reviews.router, prefix=settings.api_prefix)
+app.include_router(gamification.router, prefix=settings.api_prefix)
+app.include_router(loans.router, prefix=settings.api_prefix)
+app.include_router(admin.router, prefix=settings.api_prefix)
 
 
 @app.get(f"{settings.api_prefix}/health")

@@ -12,13 +12,18 @@ from backend.database.connection import Base, engine
 
 # Import all models so they register with Base.metadata
 from backend.database.models import (  # noqa: F401
+    Achievement,
     Book,
     BookReview,
     ChatMessage,
     ChatSession,
+    ReadingGoal,
     ReadingHistory,
     RecommendationLog,
     Student,
+    StudentReview,
+    TokenUsage,
+    UserAccount,
 )
 
 
@@ -48,6 +53,11 @@ def init_database():
         "chat_messages",
         "recommendations_log",
         "book_reviews",
+        "student_reviews",
+        "user_accounts",
+        "token_usage",
+        "achievements",
+        "reading_goals",
     }
     missing = expected - set(tables)
     if missing:

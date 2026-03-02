@@ -50,3 +50,14 @@ async def get_analytics(db: Session = Depends(get_db)):
         total_books=total_books,
         total_students=total_students,
     )
+
+
+@router.post("/auto/{student_id}")
+async def auto_recommend(student_id: str, count: int = 3, refresh: bool = False):
+    """Generate auto-recommendations for a student using the AI agent."""
+    from backend.services.auto_recommend import generate_auto_recommendations
+
+    result = await generate_auto_recommendations(student_id, count, force_refresh=refresh)
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result

@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     google_api_key: str = "your_gemini_api_key_here"
     gemini_model: str = "gemini-2.0-flash-exp"
     gemini_temperature: float = 0.7
-    gemini_max_tokens: int = 1024
+    gemini_max_tokens: int = 4096
 
     # DeepTeam guardrails
     deepteam_model: str = "gemini-2.0-flash-exp"
@@ -66,6 +66,14 @@ class Settings(BaseSettings):
     raw_data_dir: str = "./data/raw"
     processed_data_dir: str = "./data/processed"
     max_books_to_load: int = 0
+
+    # Content safety
+    enable_profanity_filter: bool = True
+    profanity_custom_words: str = ""  # CSV of additional words to block
+
+    # Book loans
+    default_loan_days: int = 14
+    max_loan_renewals: int = 2
 
     # Feature flags
     enable_librarian_review: bool = False

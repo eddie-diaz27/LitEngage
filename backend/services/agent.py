@@ -5,6 +5,7 @@ conversational book recommendation agent.
 """
 
 import logging
+import time
 from typing import Annotated, List, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -125,7 +126,7 @@ def get_reading_history(student_id: str, limit: int = 20) -> list:
             {
                 "book_id": entry.book_id,
                 "title": entry.book.title if entry.book else "Unknown",
-                "author": entry.book.author if entry.book else "Unknown",
+                "author": (entry.book.author_name or entry.book.author) if entry.book else "Unknown",
                 "status": entry.status,
                 "rating": entry.rating,
             }
@@ -148,15 +149,30 @@ def get_book_details(book_id: str) -> dict:
     from backend.database.connection import SessionLocal
     from backend.database import crud
 
+    from backend.database.models import StudentReview
+
     db = SessionLocal()
     try:
         book = crud.get_book(db, book_id)
         if not book:
             return {"error": f"Book with ID {book_id} not found"}
+
+        # Fetch recent student reviews for context
+        reviews = (
+            db.query(StudentReview)
+            .filter(
+                StudentReview.book_id == book_id,
+                StudentReview.is_approved == True,
+            )
+            .order_by(StudentReview.created_at.desc())
+            .limit(3)
+            .all()
+        )
+
         return {
             "book_id": book.id,
             "title": book.title,
-            "author": book.author,
+            "author": book.author_name or book.author,
             "description": (book.description or "")[:500],
             "genres": book.genres_json or [],
             "avg_rating": book.avg_rating,
@@ -164,6 +180,11 @@ def get_book_details(book_id: str) -> dict:
             "publication_year": book.publication_year,
             "num_pages": book.num_pages,
             "image_url": book.image_url,
+            "review_count": len(reviews),
+            "recent_reviews": [
+                {"rating": r.rating, "snippet": (r.review_text or "")[:150]}
+                for r in reviews
+            ],
         }
     finally:
         db.close()
@@ -210,7 +231,137 @@ def save_preference(
 # All tools list
 # ---------------------------------------------------------------------------
 
-AGENT_TOOLS = [search_books, get_reading_history, get_book_details, save_preference]
+@tool
+def scan_reviews(status_filter: str = "flagged", limit: int = 10) -> list:
+    """Query student reviews by moderation status.
+
+    Use this to find reviews that need librarian attention — flagged by AI
+    moderation, or still pending review.
+
+    Args:
+        status_filter: Filter by moderation status. One of: flagged, pending,
+            clean, all. Default is "flagged" to show problematic reviews.
+        limit: Maximum number of reviews to return (default 10).
+
+    Returns:
+        List of reviews with moderation details (flags, reason, student, book).
+    """
+    from backend.database.connection import SessionLocal
+    from backend.database.models import StudentReview
+
+    db = SessionLocal()
+    try:
+        query = db.query(StudentReview)
+        if status_filter != "all":
+            query = query.filter(StudentReview.moderation_status == status_filter)
+        reviews = (
+            query.order_by(StudentReview.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "review_id": r.id,
+                "student_name": r.student.name if r.student else "Unknown",
+                "book_title": r.book.title if r.book else "Unknown",
+                "rating": r.rating,
+                "review_text": (r.review_text or "")[:200],
+                "moderation_status": r.moderation_status,
+                "moderation_flags": r.moderation_flags or [],
+                "moderation_reason": r.moderation_reason or "",
+                "is_approved": r.is_approved,
+            }
+            for r in reviews
+        ]
+    finally:
+        db.close()
+
+
+@tool
+def check_loans(query_type: str = "overdue", student_id: str = None) -> dict:
+    """Check the status of book loans in the library.
+
+    Use this to find overdue books, see active checkouts, or look up a
+    specific student's loans.
+
+    Args:
+        query_type: Type of loan query. One of:
+            - "overdue" — books past their due date (default)
+            - "active" — all currently checked-out books
+            - "summary" — counts of active, overdue, due today, due this week
+            - "student" — loans for a specific student (requires student_id)
+        student_id: Required when query_type is "student". The student's ID.
+
+    Returns:
+        Loan information depending on query_type.
+    """
+    from datetime import datetime, timedelta
+    from backend.database.connection import SessionLocal
+    from backend.database.models import BookLoan
+
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+
+        if query_type == "summary":
+            active = db.query(BookLoan).filter(BookLoan.returned_at == None).all()
+            overdue = [l for l in active if l.due_date < now]
+            today_end = now.replace(hour=23, minute=59, second=59)
+            due_today = [l for l in active if l.due_date <= today_end and l.due_date >= now]
+            week_end = now + timedelta(days=7)
+            due_this_week = [l for l in active if now <= l.due_date <= week_end]
+            return {
+                "total_active": len(active),
+                "overdue": len(overdue),
+                "due_today": len(due_today),
+                "due_this_week": len(due_this_week),
+            }
+
+        if query_type == "student" and student_id:
+            loans = (
+                db.query(BookLoan)
+                .filter(BookLoan.student_id == student_id, BookLoan.returned_at == None)
+                .order_by(BookLoan.due_date.asc())
+                .all()
+            )
+        elif query_type == "overdue":
+            loans = (
+                db.query(BookLoan)
+                .filter(BookLoan.returned_at == None, BookLoan.due_date < now)
+                .order_by(BookLoan.due_date.asc())
+                .limit(20)
+                .all()
+            )
+        else:  # active
+            loans = (
+                db.query(BookLoan)
+                .filter(BookLoan.returned_at == None)
+                .order_by(BookLoan.due_date.asc())
+                .limit(20)
+                .all()
+            )
+
+        return {
+            "query_type": query_type,
+            "count": len(loans),
+            "loans": [
+                {
+                    "loan_id": l.id,
+                    "student_name": l.student.name if l.student else "Unknown",
+                    "book_title": l.book.title if l.book else "Unknown",
+                    "checked_out": str(l.checked_out_at.date()) if l.checked_out_at else "",
+                    "due_date": str(l.due_date.date()) if l.due_date else "",
+                    "days_overdue": max(0, (now - l.due_date).days) if l.due_date < now else 0,
+                    "renewed_count": l.renewed_count,
+                }
+                for l in loans
+            ],
+        }
+    finally:
+        db.close()
+
+
+AGENT_TOOLS = [search_books, get_reading_history, get_book_details, save_preference, scan_reviews, check_loans]
 
 
 # ---------------------------------------------------------------------------
@@ -325,11 +476,35 @@ async def invoke_agent(
         "user_preferences": user_preferences,
     }
 
+    start_time = time.time()
+
     try:
         result = await graph.ainvoke(initial_state, config=config)
 
-        # Extract the last AI message (skip tool-call-only messages)
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # Extract the last AI message and token usage info
         ai_message = ""
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        tools_used = []
+
+        for msg in result["messages"]:
+            if isinstance(msg, AIMessage):
+                # Collect tool call names
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tool_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                        if tool_name and tool_name not in tools_used:
+                            tools_used.append(tool_name)
+
+                # Collect token usage from usage_metadata
+                usage = getattr(msg, "usage_metadata", None)
+                if usage:
+                    total_prompt_tokens += usage.get("input_tokens", 0) if isinstance(usage, dict) else getattr(usage, "input_tokens", 0)
+                    total_completion_tokens += usage.get("output_tokens", 0) if isinstance(usage, dict) else getattr(usage, "output_tokens", 0)
+
+        # Extract the last AI message text (skip tool-call-only messages)
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage):
                 content = msg.content
@@ -344,6 +519,8 @@ async def invoke_agent(
                     ai_message = content
                     break
 
+        total_tokens = total_prompt_tokens + total_completion_tokens
+
         logger.info(
             "Agent invocation complete",
             extra={
@@ -351,15 +528,27 @@ async def invoke_agent(
                 "session_id": session_id,
                 "message_length": len(message),
                 "response_length": len(ai_message),
+                "latency_ms": latency_ms,
+                "total_tokens": total_tokens,
+                "tools_used": tools_used,
             },
         )
 
         return {
             "message": ai_message,
             "session_id": session_id,
+            "token_usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_tokens,
+            },
+            "latency_ms": latency_ms,
+            "tools_used": tools_used,
+            "model_used": settings.gemini_model,
         }
 
     except Exception as e:
+        latency_ms = int((time.time() - start_time) * 1000)
         logger.error(f"Agent invocation failed: {e}", exc_info=True)
         return {
             "message": (
@@ -367,4 +556,8 @@ async def invoke_agent(
                 "Could you try asking again?"
             ),
             "session_id": session_id,
+            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "latency_ms": latency_ms,
+            "tools_used": [],
+            "model_used": settings.gemini_model,
         }

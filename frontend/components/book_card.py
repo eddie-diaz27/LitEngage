@@ -15,7 +15,8 @@ def render_book_card(book: dict):
                 st.markdown("**No Cover**")
         with col2:
             st.markdown(f"### {book.get('title', 'Unknown Title')}")
-            st.markdown(f"*by {book.get('author', 'Unknown')}*")
+            author = book.get("author_name") or book.get("author", "Unknown")
+            st.markdown(f"*by {author}*")
 
             genres = book.get("genres_json") or book.get("genres") or []
             if genres:
@@ -40,7 +41,7 @@ def render_book_card(book: dict):
 def render_book_list_item(book: dict):
     """Render a compact book list item."""
     title = book.get("title", "Unknown")
-    author = book.get("author", "Unknown")
+    author = book.get("author_name") or book.get("author", "Unknown")
     rating = book.get("avg_rating", 0)
 
     col1, col2, col3 = st.columns([4, 2, 1])

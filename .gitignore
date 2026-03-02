@@ -7,6 +7,9 @@ __pycache__/
 venv/
 env/
 ENV/
+*.egg-info/
+dist/
+build/
 
 # Environment variables
 .env
@@ -20,6 +23,9 @@ data/processed/
 
 # Vector store
 data/chroma_books_db/
+
+# Demo script backup (generated at runtime)
+data/demo_review_backup.json
 
 # Logs
 logs/
@@ -38,7 +44,11 @@ Thumbs.db
 # Streamlit
 .streamlit/secrets.toml
 
-# Testing
+# Testing / evaluation
 .pytest_cache/
 .coverage
 htmlcov/
+.deepeval/
+
+# Claude Code
+.claude/
